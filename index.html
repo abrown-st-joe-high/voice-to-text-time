@@ -61,6 +61,7 @@ summary{cursor:pointer;font-weight:600}
     <b>Fix a word:</b> double-click it (highlights), then say the correct word. Drag across several words (or Shift+click) to replace a phrase; the next thing said replaces the highlight and typing returns to the end.
     <b>Alternatives:</b> single-click a word for similar-sounding options.
     <b>Commands:</b> say "period", "comma", "question mark", "exclamation point", "colon", "semicolon", "new line", "new paragraph". Say "literal period" to write the word itself.
+    <b>Delete:</b> Backspace or saying "delete that" removes the last word. If a similar-sounding word is said right after, the next alternative is used (likely a mis-hearing), and repeating cycles through the options. Saying "cap that" capitalizes the previous word.
     <b>Esc</b> cancels a highlight.
   </div>
 
@@ -83,12 +84,14 @@ let tokens = store.get('vtt-draft', []);      // committed tokens: {k:'w'|'p'|'b
 let history = store.get('vtt-history', []);
 let interim = [];                              // live (not yet final) tokens
 let sel = null;                                // {s,e} highlighted token range
+let redo = null;                               // cycle state after a deletion
 let listening = false, rec = null, clickTimer = null, dragStart = null, drag = false;
 const save = () => store.set('vtt-draft', tokens);
 
 /* ---------- speech -> tokens ---------- */
 const CMD = {'period':'.','full stop':'.','comma':',','question mark':'?','exclamation point':'!','exclamation mark':'!',
-  'colon':':','semicolon':';','new line':1,'newline':1,'new paragraph':2};
+  'colon':':','semicolon':';','new line':1,'newline':1,'new paragraph':2,
+  'delete that':{a:'del'},'cap that':{a:'cap'},'capitalize that':{a:'cap'}};
 const clean = w => w.toLowerCase().replace(/[.,?!:;]+$/, '');
 
 function parse(text, alts = []){
@@ -115,23 +118,84 @@ function parse(text, alts = []){
       if (ph in CMD){ hit = CMD[ph]; len = n; break; }
     }
     if (hit !== null){
-      out.push(typeof hit === 'number' ? {k:'b', n:hit} : {k:'p', t:hit});
+      out.push(typeof hit === 'number' ? {k:'b', n:hit} : typeof hit === 'object' ? {k:'c', a:hit.a} : {k:'p', t:hit});
       i += len;
     } else { addWord(i); i++; }
   }
   return out;
 }
 
+function lev(a, b){
+  const d = Array.from({length:a.length + 1}, (_, i) => [i]);
+  for (let j = 1; j <= b.length; j++) d[0][j] = j;
+  for (let i = 1; i <= a.length; i++) for (let j = 1; j <= b.length; j++)
+    d[i][j] = Math.min(d[i-1][j] + 1, d[i][j-1] + 1, d[i-1][j-1] + (a[i-1] === b[j-1] ? 0 : 1));
+  return d[a.length][b.length];
+}
+const candsOf = t => {
+  const lc = t.t.toLowerCase();
+  return [...new Set([...(t.alts || []), ...(HM[lc] || []), ...(NM[lc] || [])].map(x => x.toLowerCase()))].filter(x => x !== lc);
+};
+
+/* After a word is deleted, a similar-sounding replacement is treated as a repeat of the same
+   mis-transcription, so the next alternative is used instead (cycling through the options). */
+function cycle(t){
+  const r = redo;
+  if (!r || !r.armed){ redo = null; return t; }
+  r.armed = false;
+  if (t.k !== 'w'){ redo = null; return t; }
+  const lc = t.t.toLowerCase();
+  const maxL = Math.max(lc.length, r.base.length);
+  const similar = r.tried.has(lc) || r.cands.includes(lc) || (t.alts || []).some(a => r.tried.has(a.toLowerCase()))
+    || lev(lc, r.base) <= Math.min(2, Math.max(1, Math.floor(maxL / 3)));
+  if (!similar){ redo = null; return t; }
+  r.tried.add(lc);
+  const pool = [...new Set([...r.cands, ...(t.alts || []).map(a => a.toLowerCase()), ...(HM[lc] || []), ...(NM[lc] || [])])];
+  let next = pool.find(w => !r.tried.has(w));
+  if (!next){ r.tried = new Set([lc]); next = pool.find(w => w !== lc); }   // wrap around
+  if (!next){ redo = null; return t; }
+  r.tried.add(next);
+  return {...t, t:next, alts:[...new Set([lc, ...pool])].filter(w => w !== next)};
+}
+
+function deleteLast(){
+  hidePop();
+  if (sel){ tokens.splice(sel.s, sel.e - sel.s + 1); sel = null; redo = null; save(); render(); return; }
+  const t = tokens.pop();
+  if (!t) return;
+  if (t.k === 'w'){
+    const lc = t.t.toLowerCase();
+    if (redo && redo.tried.has(lc)) redo.armed = true;
+    else redo = {base:lc, cands:candsOf(t), tried:new Set([lc]), armed:true};
+  } else redo = null;
+  save(); render();
+}
+
+function act(a){
+  if (a === 'del') deleteLast();
+  else if (a === 'cap'){
+    for (let i = tokens.length - 1; i >= 0; i--) if (tokens[i].k === 'w'){
+      const w = tokens[i].t; tokens[i] = {...tokens[i], t:w[0].toUpperCase() + w.slice(1)}; break;
+    }
+  }
+}
+
 function commit(n){
   if (!n.length) return;
   hidePop();
-  if (sel){
-    const one = sel.s === sel.e;
-    const rep = one ? n.slice(0, 1) : n, rest = one ? n.slice(1) : [];
-    tokens.splice(sel.s, sel.e - sel.s + 1, ...rep);
-    sel = null;                  // cursor returns to the end
-    tokens.push(...rest);
-  } else tokens.push(...n);
+  let pos = null, first = true;
+  for (const t of n){
+    if (t.k === 'c'){ act(t.a); continue; }
+    let tok = t;
+    if (first){ first = false; if (!sel) tok = cycle(t); else redo = null; }
+    if (sel){
+      const s = sel.s, e = sel.e;
+      tokens.splice(s, e - s + 1, tok);
+      if (s !== e) pos = s + 1;      // phrase highlight: whole utterance replaces it
+      sel = null;                    // single word: rest of speech goes to the end
+    } else if (pos !== null) tokens.splice(pos++, 0, tok);
+    else tokens.push(tok);
+  }
   save();
 }
 
@@ -156,8 +220,9 @@ const textOf = T => layout(T.map((t, i) => ({t, i}))).map(x => x.br ? '\n'.repea
 
 function buildList(){
   const T = tokens.map((t, i) => ({t, i, sel: sel && i >= sel.s && i <= sel.e}));
-  if (!interim.length) return T;
-  const I = interim.map(t => ({t, i:-1, live:true}));
+  const iv = interim.filter(t => t.k !== 'c');
+  if (!iv.length) return T;
+  const I = iv.map(t => ({t, i:-1, live:true}));
   if (!sel) return T.concat(I);
   const one = sel.s === sel.e, rep = one ? I.slice(0, 1) : I, rest = one ? I.slice(1) : [];
   rep.forEach(x => x.sel = true);
@@ -227,7 +292,7 @@ function showPop(i){
   sec('Similar words', (NM[lc] || []).concat(variants(lc)));
   sec('Capitalization', [lc === base ? lc[0].toUpperCase() + lc.slice(1) : lc]);
   const inp = document.createElement('input'); inp.placeholder = 'Type a different word, then Enter';
-  inp.onkeydown = e => { if (e.key === 'Enter' && inp.value.trim()) apply(parse(inp.value)); };
+  inp.onkeydown = e => { if (e.key === 'Enter' && inp.value.trim()) apply(parse(inp.value).filter(t => t.k !== 'c')); };
   pop.appendChild(inp);
   const row = document.createElement('div'); row.className = 'row';
   const bv = document.createElement('button'); bv.textContent = '🎤 Replace by voice';
@@ -275,7 +340,10 @@ out.addEventListener('dblclick', e => {
   const i = +s.dataset.i; selectRange(i, i);
 });
 document.addEventListener('mousedown', e => { if (!e.target.closest('#pop')) hidePop(); });
-document.addEventListener('keydown', e => { if (e.key === 'Escape'){ hidePop(); sel = null; render(); } });
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape'){ hidePop(); sel = null; render(); }
+  else if (e.key === 'Backspace' && !/^(INPUT|TEXTAREA)$/.test((e.target.tagName || ''))){ e.preventDefault(); deleteLast(); }
+});
 
 /* ---------- microphone ---------- */
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
